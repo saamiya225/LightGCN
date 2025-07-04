@@ -1,96 +1,87 @@
-import torch
 import argparse
-from lightgcn.dataloader import load_dataset
+import time
+import torch
+import torch.optim as optim
 from lightgcn.model import LightGCN
 from lightgcn.utils import bpr_loss, sample_train_batch
+from lightgcn.dataloader import load_dataset, build_norm_adj_matrix
 from lightgcn.evaluate import evaluate_on_df
+
+
 import numpy as np
-from scipy.sparse import coo_matrix
-import pandas as pd
+
+# ✅ Set all CPU threads on your Mac M2
+torch.set_num_threads(8)
+print(f"✅ Using {torch.get_num_threads()} CPU threads")
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='amazon-book')
-parser.add_argument('--embedding_dim', type=int, default=64)
-parser.add_argument('--num_layers', type=int, default=3)
-parser.add_argument('--reg_lambda', type=float, default=1e-4)
-parser.add_argument('--lr', type=float, default=0.001)
-parser.add_argument('--epochs', type=int, default=100)
-parser.add_argument('--batch_size', type=int, default=1024)
-parser.add_argument('--steps', type=int, default=260)
-parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+parser.add_argument("--dataset", type=str, default="amazon-book")
+parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 args = parser.parse_args()
 
-# =====================
-# Load dataset
-# =====================
 print(f"📚 Loading dataset: {args.dataset}")
 train_df, test_df, num_users, num_items = load_dataset(f"./datasets/{args.dataset}")
+print(f"✅ Train interactions: {len(train_df)}  | Test interactions: {len(test_df)}")
+device = torch.device(args.device)
+print(f"✅ Using device: {device}")
 
-# Split test into validation + final test
-val_df = test_df.sample(frac=0.5, random_state=42)
-final_test_df = test_df.drop(val_df.index)
-print(f"✅ Train: {len(train_df)} | Validation: {len(val_df)} | Test: {len(final_test_df)}")
+# ✅ Build normalized adjacency matrix
+norm_adj_matrix = build_norm_adj_matrix(train_df, num_users, num_items)
+norm_adj_matrix = norm_adj_matrix.to(device)
 
-# =====================
-# Build normalized adjacency matrix
-# =====================
-interactions = pd.concat([train_df[["user_idx", "item_idx"]], val_df[["user_idx", "item_idx"]]])
-interactions["item_idx"] += num_users  # shift item indices
-rows, cols = interactions["user_idx"], interactions["item_idx"]
-values = np.ones(len(interactions))
-adj = coo_matrix((values, (rows, cols)), shape=(num_users + num_items, num_users + num_items))
-adj = adj + adj.T  # symmetric
-deg = np.array(adj.sum(axis=1)).flatten()
-deg_inv_sqrt = np.power(deg, -0.5, where=deg!=0)
-D_inv_sqrt = coo_matrix((deg_inv_sqrt, (np.arange(len(deg_inv_sqrt)), np.arange(len(deg_inv_sqrt)))), shape=adj.shape)
-norm_adj = D_inv_sqrt @ adj @ D_inv_sqrt
-norm_adj = norm_adj.tocoo()
-indices = torch.tensor([norm_adj.row, norm_adj.col], dtype=torch.long)
-values = torch.tensor(norm_adj.data, dtype=torch.float32)
-norm_adj_matrix = torch.sparse.FloatTensor(indices, values, torch.Size(norm_adj.shape)).to(args.device)
+# ✅ Split test into val + final test
+val_frac = 0.2
+val_mask = np.random.rand(len(test_df)) < val_frac
+val_df = test_df[val_mask]
+final_test_df = test_df[~val_mask]
+print(f"✅ Validation: {len(val_df)} | Final test: {len(final_test_df)}")
 
-# =====================
-# Instantiate model
-# =====================
-model = LightGCN(num_users, num_items, args.embedding_dim, args.num_layers, norm_adj_matrix).to(args.device)
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+# ✅ Optuna-tuned hyperparameters
+embedding_dim = 64
+num_layers = 3
+reg_lambda = 1.0259391362164704e-05
+lr = 0.004887702327256174
+batch_size = 1024
+epochs = 40
+steps = 260
 
-# =====================
-# Training loop
-# =====================
+# ✅ Build model & optimizer
+model = LightGCN(num_users, num_items, embedding_dim, num_layers, norm_adj_matrix).to(device)
+optimizer = optim.Adam(model.parameters(), lr=lr)
+
+# 🚀 Start training
 print("🚀 Starting training...")
-for epoch in range(1, args.epochs + 1):
+for epoch in range(1, epochs + 1):
+    start_time = time.time()
     model.train()
     total_loss = 0
 
-    for step in range(args.steps):
-        users, pos_items, neg_items = sample_train_batch(train_df, num_users, num_items, args.batch_size)
-        users = torch.LongTensor(users).to(args.device)
-        pos_items = torch.LongTensor(pos_items).to(args.device)
-        neg_items = torch.LongTensor(neg_items).to(args.device)
+    for step in range(steps):
+        users, pos_items, neg_items = sample_train_batch(train_df, num_users, num_items, batch_size)
+        users = torch.LongTensor(users).to(device)
+        pos_items = torch.LongTensor(pos_items).to(device)
+        neg_items = torch.LongTensor(neg_items).to(device)
 
         user_emb, item_emb = model()
         u_emb = user_emb[users]
         p_emb = item_emb[pos_items]
         n_emb = item_emb[neg_items]
 
-        loss = bpr_loss(u_emb, p_emb, n_emb, args.reg_lambda)
+        loss = bpr_loss(u_emb, p_emb, n_emb, reg_lambda)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
         total_loss += loss.item()
 
-    avg_loss = total_loss / args.steps
-    print(f"Epoch {epoch}/{args.epochs}, Loss: {avg_loss:.6f}")
+    avg_loss = total_loss / steps
+    duration = time.time() - start_time
+    print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss:.6f} (took {duration:.2f}s)")
 
     if epoch % 10 == 0:
-        hr, ndcg = evaluate_on_df(model, val_df, K=20, device=args.device)
+        hr, ndcg = evaluate_on_df(model, val_df, K=20)
         print(f"  ↳ Validation HR@20 = {hr:.4f}, NDCG@20 = {ndcg:.4f}")
 
-# =====================
-# Final evaluation on test
-# =====================
-test_hr, test_ndcg = evaluate_on_df(model, final_test_df, K=20, device=args.device)
+# ✅ Final test evaluation
+test_hr, test_ndcg = evaluate_on_df(model, final_test_df, K=20)
 print(f"\n🎯 FINAL TEST RESULTS on {args.dataset}: HR@20 = {test_hr:.4f}, NDCG@20 = {test_ndcg:.4f}")
