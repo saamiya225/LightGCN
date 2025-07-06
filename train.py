@@ -2,8 +2,8 @@ import argparse
 import time
 import torch
 import torch.optim as optim
-from lightgcn.model import LightGCN
-from lightgcn.utils import bpr_loss, sample_train_batch
+from lightgcn.lightgcn_model import LightGCN, bpr_loss
+from lightgcn.utils import sample_train_batch, evaluate_on_df
 from lightgcn.dataloader import load_dataset, build_norm_adj_matrix
 from lightgcn.evaluate import evaluate_on_df
 
